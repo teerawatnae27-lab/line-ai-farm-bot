@@ -1,0 +1,9 @@
+{
+  "name": "line-ai-farm-bot-vercel",
+  "version": "1.0.0",
+  "description": "LINE OA bot บน Vercel Serverless Function ใช้ Google Gemini API - ไม่ต้องดูแลเซิร์ฟเวอร์เอง",
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@line/bot-sdk": "^9.4.0"
+  }
+}
