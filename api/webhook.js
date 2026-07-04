@@ -54,6 +54,9 @@ async function handleEvent(event) {
   if (event.type === "message" && event.message.type === "image") {
     return handleImageMessage(event);
   }
+  if (event.type === "message" && event.message.type === "location") {
+    return handleLocationMessage(event);
+  }
   return Promise.resolve(null);
 }
 
@@ -64,6 +67,8 @@ async function handleTextMessage(event) {
   const welcomeMsg =
     "🌱 สวัสดีครับ ผมเป็นผู้ช่วยเกษตรกรอัจฉริยะ\n\n" +
     "📷 ส่งรูปใบ/ต้นพืชที่มีปัญหา ผมจะช่วยวิเคราะห์เบื้องต้นให้ครับ\n" +
+    "🌤️ พิมพ์ \"อากาศ ตามด้วยชื่อจังหวัด/อำเภอ\" เช่น \"อากาศ เชียงใหม่\" เพื่อดูพยากรณ์อากาศ\n" +
+    "📍 หรือกดแชร์ตำแหน่ง (Location) เพื่อดูพยากรณ์อากาศจากพิกัดจริง แม่นยำกว่า\n" +
     "💬 พิมพ์คำถามเกี่ยวกับการเพาะปลูกได้เลย";
 
   if (["สวัสดี", "hello", "hi", "help", "เริ่ม"].includes(text.toLowerCase())) {
@@ -73,10 +78,37 @@ async function handleTextMessage(event) {
     });
   }
 
+  // คำสั่งพยากรณ์อากาศ: "อากาศ <ชื่อสถานที่>"
+  if (text.startsWith("อากาศ")) {
+    const place = text.replace("อากาศ", "").trim();
+    if (!place) {
+      return lineClient.replyMessage(event.replyToken, {
+        type: "text",
+        text: "กรุณาพิมพ์ชื่อจังหวัด/อำเภอต่อท้ายด้วยครับ เช่น \"อากาศ เชียงใหม่\"\nหรือกดแชร์ตำแหน่ง (Location) จากเมนู + ในแชทก็ได้ครับ",
+      });
+    }
+    const weatherReply = await getWeatherByPlaceName(place);
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: weatherReply,
+    });
+  }
+
   const aiReply = await askGeminiText(text);
   return lineClient.replyMessage(event.replyToken, {
     type: "text",
     text: aiReply,
+  });
+}
+
+// ------------ ตำแหน่งที่แชร์มาจาก LINE (Location message) ------------
+async function handleLocationMessage(event) {
+  const { latitude, longitude, title } = event.message;
+  const weatherReply = await getWeatherByCoords(latitude, longitude, title);
+
+  return lineClient.replyMessage(event.replyToken, {
+    type: "text",
+    text: weatherReply,
   });
 }
 
@@ -139,4 +171,109 @@ async function askGeminiText(userText) {
   const result = await model.generateContent([systemPrompt, userText]);
 
   return result.response.text().trim();
+}
+
+// ============================================================
+// ฟีเจอร์พยากรณ์อากาศ (ใช้ Open-Meteo API ฟรี ไม่ต้องมี API key)
+// เอกสาร: https://open-meteo.com/
+// ============================================================
+
+// ------------ ค้นหาพิกัดจากชื่อสถานที่ แล้วดึงพยากรณ์อากาศ ------------
+async function getWeatherByPlaceName(place) {
+  try {
+    const geoUrl =
+      "https://geocoding-api.open-meteo.com/v1/search?" +
+      `name=${encodeURIComponent(place)}&count=1&language=th&format=json`;
+
+    const geoRes = await fetch(geoUrl);
+    const geoData = await geoRes.json();
+
+    if (!geoData.results || geoData.results.length === 0) {
+      return `ขออภัยครับ หาสถานที่ชื่อ "${place}" ไม่เจอ ลองพิมพ์เป็นชื่อจังหวัดหรืออำเภอเป็นภาษาไทย/อังกฤษดูอีกครั้งครับ\nหรือกดแชร์ตำแหน่ง (Location) จากเมนู + ในแชทแทนก็ได้ครับ`;
+    }
+
+    const location = geoData.results[0];
+    const displayName = location.name || place;
+
+    return getWeatherByCoords(location.latitude, location.longitude, displayName);
+  } catch (err) {
+    console.error("Geocoding error:", err);
+    return "ขออภัยครับ ระบบค้นหาตำแหน่งขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
+  }
+}
+
+// ------------ ดึงพยากรณ์อากาศจากพิกัด lat/lon ------------
+async function getWeatherByCoords(lat, lon, placeName) {
+  try {
+    const weatherUrl =
+      "https://api.open-meteo.com/v1/forecast?" +
+      `latitude=${lat}&longitude=${lon}` +
+      "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max" +
+      "&timezone=Asia%2FBangkok&forecast_days=4";
+
+    const res = await fetch(weatherUrl);
+    const data = await res.json();
+
+    if (!data.daily) {
+      return "ขออภัยครับ ดึงข้อมูลพยากรณ์อากาศไม่สำเร็จ กรุณาลองใหม่อีกครั้งครับ";
+    }
+
+    const { time, weather_code, temperature_2m_max, temperature_2m_min, precipitation_probability_max } =
+      data.daily;
+
+    const dayLabels = ["วันนี้", "พรุ่งนี้", "มะรืนนี้", "อีก 3 วัน"];
+
+    let reply = `🌤️ พยากรณ์อากาศ${placeName ? " - " + placeName : ""}\n\n`;
+
+    for (let i = 0; i < time.length && i < dayLabels.length; i++) {
+      const icon = weatherCodeToIcon(weather_code[i]);
+      const desc = weatherCodeToThai(weather_code[i]);
+      reply += `${dayLabels[i]}: ${icon} ${desc}\n`;
+      reply += `   🌡️ ${temperature_2m_min[i]}-${temperature_2m_max[i]}°C  💧 ฝนตก ${precipitation_probability_max[i]}%\n`;
+    }
+
+    reply += "\n💡 หากมีโอกาสฝนตกสูง ควรเลี่ยงการฉีดพ่นปุ๋ย/ยาในวันนั้น";
+
+    return reply;
+  } catch (err) {
+    console.error("Weather fetch error:", err);
+    return "ขออภัยครับ ระบบพยากรณ์อากาศขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
+  }
+}
+
+// ------------ แปลงรหัสสภาพอากาศ (WMO code) เป็นข้อความไทย ------------
+function weatherCodeToThai(code) {
+  const map = {
+    0: "ท้องฟ้าแจ่มใส",
+    1: "แจ่มใสเป็นส่วนใหญ่",
+    2: "มีเมฆบางส่วน",
+    3: "มีเมฆมาก",
+    45: "หมอก",
+    48: "หมอกน้ำแข็ง",
+    51: "ฝนปรอยเบา",
+    53: "ฝนปรอยปานกลาง",
+    55: "ฝนปรอยหนัก",
+    61: "ฝนตกเบา",
+    63: "ฝนตกปานกลาง",
+    65: "ฝนตกหนัก",
+    71: "หิมะตกเบา",
+    80: "ฝนตกเป็นช่วง",
+    81: "ฝนตกเป็นช่วงปานกลาง",
+    82: "ฝนตกเป็นช่วงหนัก",
+    95: "พายุฝนฟ้าคะนอง",
+    96: "พายุฝนฟ้าคะนองมีลูกเห็บ",
+  };
+  return map[code] || "ไม่ทราบสภาพอากาศ";
+}
+
+// ------------ แปลงรหัสสภาพอากาศเป็นไอคอน emoji ------------
+function weatherCodeToIcon(code) {
+  if (code === 0 || code === 1) return "☀️";
+  if (code === 2) return "🌤️";
+  if (code === 3) return "☁️";
+  if (code === 45 || code === 48) return "🌫️";
+  if ([51, 53, 55, 61, 63, 65, 80, 81, 82].includes(code)) return "🌧️";
+  if (code === 71) return "❄️";
+  if (code === 95 || code === 96) return "⛈️";
+  return "🌡️";
 }
