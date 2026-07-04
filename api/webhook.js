@@ -18,6 +18,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // รุ่นฟรี ใช้ได้ในปริมาณจำกัดต่อวัน เหมาะกับช่วงเริ่มทดสอบ
 const MODEL_NAME = "gemini-2.5-flash";
 
+// User ID ส่วนตัวของเจ้าของบอท (ใช้ส่งแจ้งเตือนเมื่อมีคนกดปุ่ม "ติดต่อทีมงาน")
+// วิธีหาค่านี้ดูในไฟล์ README หรือคำแนะนำที่แนบมาด้วย
+const OWNER_USER_ID = process.env.OWNER_USER_ID;
+
 const lineClient = new line.Client(lineConfig);
 
 // ------------ ฟังก์ชันหลักที่ Vercel เรียกทุกครั้งที่มี request เข้ามา ------------
@@ -48,6 +52,11 @@ module.exports = async (req, res) => {
 
 // ------------ จัดการแต่ละ event ------------
 async function handleEvent(event) {
+  // Log userId ไว้ช่วยหา OWNER_USER_ID ตอนตั้งค่าครั้งแรก (ดูได้ที่ Vercel > Logs)
+  if (event.source && event.source.userId) {
+    console.log("Incoming event from userId:", event.source.userId);
+  }
+
   if (event.type === "message" && event.message.type === "text") {
     return handleTextMessage(event);
   }
@@ -95,10 +104,25 @@ async function handleTextMessage(event) {
   }
 
   // ปุ่มเมนู: ติดต่อทีมงาน
-  if (text === "ติดต่อทีมงาน") {
+  if (text.startsWith("ติดต่อทีมงาน")) {
+    const detail = text.replace("ติดต่อทีมงาน", "").trim();
+
+    if (!detail) {
+      // กดปุ่มมาเฉยๆ ยังไม่มีรายละเอียด ให้พิมพ์ใหม่รวมข้อมูลในข้อความเดียว
+      return lineClient.replyMessage(event.replyToken, {
+        type: "text",
+        text:
+          "📞 ติดต่อทีมงานผู้ช่วยเกษตรกร AI\n\n" +
+          "กรุณาพิมพ์ข้อความเดียว โดยใส่เบอร์โทร/คำถามของคุณต่อท้ายคำว่า \"ติดต่อทีมงาน\" เลยครับ เช่น:\n\n" +
+          "ติดต่อทีมงาน เบอร์ 08x-xxx-xxxx อยากสอบถามเรื่องสมัครใช้บอทสำหรับกลุ่มเกษตรกร 20 คน",
+      });
+    }
+
+    // มีรายละเอียดแนบมาด้วย ส่งแจ้งเตือนพร้อมเนื้อหาไปหาเจ้าของบอททันที
+    await notifyOwner(event, "ฝากข้อความติดต่อทีมงาน", detail);
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
-      text: "📞 ติดต่อทีมงานผู้ช่วยเกษตรกร AI\n\nพิมพ์ข้อความฝากไว้ตรงนี้ได้เลยครับ ทีมงานจะติดต่อกลับโดยเร็วที่สุด\n(หรือใส่เบอร์โทร/LINE ID/อีเมลของทีมคุณตรงนี้ได้)",
+      text: "✅ ส่งข้อความถึงทีมงานเรียบร้อยแล้วครับ ทีมงานได้รับรายละเอียดของคุณแล้ว จะติดต่อกลับโดยเร็วที่สุดครับ",
     });
   }
 
@@ -123,6 +147,48 @@ async function handleTextMessage(event) {
     type: "text",
     text: aiReply,
   });
+}
+
+// ------------ ส่งแจ้งเตือนไปหาเจ้าของบอท (เมื่อมีคนติดต่อทีมงาน) ------------
+async function notifyOwner(event, actionLabel, detail) {
+  if (!OWNER_USER_ID) {
+    console.error(
+      "ยังไม่ได้ตั้งค่า OWNER_USER_ID ใน Environment Variables จึงส่งแจ้งเตือนไม่ได้"
+    );
+    return;
+  }
+
+  try {
+    const userId = event.source.userId;
+    let displayName = "(ไม่ทราบชื่อ)";
+
+    try {
+      const profile = await lineClient.getProfile(userId);
+      displayName = profile.displayName;
+    } catch (e) {
+      console.error("ดึงโปรไฟล์ผู้ใช้ไม่สำเร็จ:", e);
+    }
+
+    const now = new Date().toLocaleString("th-TH", { timeZone: "Asia/Bangkok" });
+
+    let messageText =
+      `🔔 แจ้งเตือน: มีลูกค้า${actionLabel}\n\n` +
+      `👤 ชื่อ: ${displayName}\n` +
+      `🕐 เวลา: ${now}\n`;
+
+    if (detail) {
+      messageText += `\n💬 ข้อความจากลูกค้า:\n"${detail}"\n`;
+    }
+
+    messageText += `\nวิธีตอบกลับ: เปิด LINE Official Account Manager (manager.line.biz) > เมนู "แชท" > ค้นหาชื่อ "${displayName}" แล้วพิมพ์ตอบกลับได้โดยตรงครับ`;
+
+    await lineClient.pushMessage(OWNER_USER_ID, {
+      type: "text",
+      text: messageText,
+    });
+  } catch (err) {
+    console.error("ส่งแจ้งเตือนหาเจ้าของบอทไม่สำเร็จ:", err);
+  }
 }
 
 // ------------ ตำแหน่งที่แชร์มาจาก LINE (Location message) ------------
