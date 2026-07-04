@@ -85,6 +85,7 @@ async function handleTextMessage(event) {
     "📷 ส่งรูปใบ/ต้นพืชที่มีปัญหา ผมจะช่วยวิเคราะห์เบื้องต้นให้ครับ\n" +
     "🌤️ พิมพ์ \"อากาศ ตามด้วยชื่อจังหวัด/อำเภอ\" เช่น \"อากาศ เชียงใหม่\" เพื่อดูพยากรณ์อากาศ\n" +
     "📍 หรือกดแชร์ตำแหน่ง (Location) เพื่อดูพยากรณ์อากาศจากพิกัดจริง แม่นยำกว่า\n" +
+    "💰 พิมพ์ \"ราคา ตามด้วยชื่อสินค้า\" เช่น \"ราคาข้าวหอมมะลิ\" เพื่อดูราคาพืชผลล่าสุด\n" +
     "💬 พิมพ์คำถามเกี่ยวกับการเพาะปลูกได้เลย ถามต่อเนื่องได้ บอทจะจำบทสนทนาไว้ให้ (ถ้าอยากเริ่มหัวข้อใหม่ พิมพ์ \"เริ่มคุยใหม่\")\n\n" +
     "🔒 การใช้งานบอทนี้ถือว่ายอมรับการเก็บข้อมูลตามนโยบายความเป็นส่วนตัว พิมพ์ \"ความเป็นส่วนตัว\" เพื่อดูรายละเอียดครับ";
 
@@ -177,6 +178,22 @@ async function handleTextMessage(event) {
     });
   }
 
+  // คำสั่งราคาพืชผล: "ราคา <ชื่อสินค้า>"
+  if (text.startsWith("ราคา")) {
+    const keyword = text.replace("ราคา", "").trim();
+    if (!keyword) {
+      return lineClient.replyMessage(event.replyToken, {
+        type: "text",
+        text: "กรุณาพิมพ์ชื่อสินค้าต่อท้ายด้วยครับ เช่น \"ราคาข้าวหอมมะลิ\" หรือ \"ราคามะเขือเทศ\"",
+      });
+    }
+    const priceReply = await getCropPriceByKeyword(keyword);
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: priceReply,
+    });
+  }
+
   try {
     const userId = event.source.userId;
     const history = await getConversationHistory(userId);
@@ -247,6 +264,72 @@ async function clearConversationHistory(userId) {
     });
   } catch (err) {
     console.error("clearConversationHistory error:", err);
+  }
+}
+
+// ============================================================
+// ฟีเจอร์ราคาพืชผลรายวัน (ใช้ MOC Open Data ฟรี ไม่ต้องมี API key)
+// เอกสาร: https://data.moc.go.th/OpenData/GISProductPrice
+// ============================================================
+
+// ------------ ค้นหารหัสสินค้าจากชื่อ แล้วดึงราคาล่าสุด ------------
+async function getCropPriceByKeyword(keyword) {
+  try {
+    const searchUrl = `https://dataapi.moc.go.th/gis-products?keyword=${encodeURIComponent(
+      keyword
+    )}`;
+
+    const searchRes = await fetch(searchUrl);
+    const searchData = await searchRes.json();
+
+    if (!searchData || searchData.length === 0) {
+      return `ขออภัยครับ ไม่พบสินค้าชื่อ "${keyword}" ในฐานข้อมูล ลองพิมพ์ชื่อสินค้าให้ตรงมากขึ้น เช่น "ราคาข้าวหอมมะลิ" หรือ "ราคามะเขือเทศสีดา" ครับ`;
+    }
+
+    // เลือกผลลัพธ์แรกที่เจอ
+    const product = searchData[0];
+    return getCropPriceByProductId(product.product_id, product.product_name, product.sell_type);
+  } catch (err) {
+    console.error("getCropPriceByKeyword error:", err);
+    return "ขออภัยครับ ระบบค้นหาราคาสินค้าขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
+  }
+}
+
+// ------------ ดึงราคาสินค้าตามรหัส (ย้อนหลัง 7 วัน) ------------
+async function getCropPriceByProductId(productId, productName, sellType) {
+  try {
+    const today = new Date();
+    const weekAgo = new Date(today);
+    weekAgo.setDate(today.getDate() - 7);
+
+    const formatDate = (d) => d.toISOString().split("T")[0];
+
+    const priceUrl =
+      `https://dataapi.moc.go.th/gis-product-price?product_id=${productId}` +
+      `&from_date=${formatDate(weekAgo)}&to_date=${formatDate(today)}`;
+
+    const priceRes = await fetch(priceUrl);
+    const priceData = await priceRes.json();
+
+    if (!priceData || !priceData.price_list || priceData.price_list.length === 0) {
+      return `ขออภัยครับ ยังไม่มีข้อมูลราคาล่าสุดของ "${productName}" ในช่วง 7 วันที่ผ่านมาครับ`;
+    }
+
+    const latest = priceData.price_list[priceData.price_list.length - 1];
+    const unit = priceData.unit || "หน่วย";
+    const typeLabel = sellType === "ขายส่ง" ? "ราคาขายส่ง" : "ราคาขายปลีก";
+
+    let reply =
+      `💰 ${typeLabel} - ${priceData.product_name || productName}\n\n` +
+      `📅 ข้อมูลล่าสุดวันที่: ${latest.date}\n` +
+      `💵 ราคา: ${latest.price_min}-${latest.price_max} บาท/${unit}\n\n` +
+      `📊 เฉลี่ย 7 วันที่ผ่านมา: ${priceData.price_min_avg}-${priceData.price_max_avg} บาท/${unit}\n\n` +
+      `ข้อมูลจาก: กรมการค้าภายใน กระทรวงพาณิชย์`;
+
+    return reply;
+  } catch (err) {
+    console.error("getCropPriceByProductId error:", err);
+    return "ขออภัยครับ ระบบดึงราคาสินค้าขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
   }
 }
 
