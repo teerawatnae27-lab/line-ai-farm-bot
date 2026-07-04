@@ -12,6 +12,7 @@
 const richMenuImageBase64 = require("./richmenu-image");
 
 const LINE_API = "https://api.line.me/v2/bot";
+const LINE_API_DATA = "https://api-data.line.me/v2/bot"; // อัปโหลด/ดาวน์โหลดไฟล์ต้องใช้โดเมนนี้
 const ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
 module.exports = async (req, res) => {
@@ -86,7 +87,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    const uploadRes = await fetch(`${LINE_API}/richmenu/${richMenuId}/content`, {
+    const uploadRes = await fetch(`${LINE_API_DATA}/richmenu/${richMenuId}/content`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${ACCESS_TOKEN}`,
