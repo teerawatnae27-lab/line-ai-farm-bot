@@ -75,18 +75,46 @@ module.exports = async (req, res) => {
     // ------------ ขั้นที่ 2: อัปโหลดรูปภาพเมนู ------------
     const imageBuffer = Buffer.from(richMenuImageBase64, "base64");
 
+    // ตรวจสอบเบื้องต้นว่าไฟล์ base64 ไม่ได้ถูกตัดขาดตอนคัดลอกวาง
+    if (imageBuffer.length < 50000) {
+      return res.status(500).json({
+        step: "validate image",
+        error:
+          "ไฟล์รูปภาพมีขนาดเล็กผิดปกติ (" +
+          imageBuffer.length +
+          " bytes) น่าจะเกิดจากตอนคัดลอกโค้ด richmenu-image.js ไม่ครบ กรุณาคัดลอกใหม่อีกครั้งให้ครบทั้งบรรทัด",
+      });
+    }
+
     const uploadRes = await fetch(`${LINE_API}/richmenu/${richMenuId}/content`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${ACCESS_TOKEN}`,
         "Content-Type": "image/png",
+        "Content-Length": String(imageBuffer.length),
       },
       body: imageBuffer,
     });
 
     if (!uploadRes.ok) {
-      const uploadErr = await uploadRes.text();
-      return res.status(500).json({ step: "upload image", error: uploadErr });
+      let uploadErr = "";
+      try {
+        uploadErr = await uploadRes.text();
+      } catch (e) {
+        uploadErr = "(อ่านข้อความ error ไม่ได้)";
+      }
+      return res.status(500).json({
+        step: "upload image",
+        status: uploadRes.status,
+        statusText: uploadRes.statusText,
+        error: uploadErr || "(ไม่มีรายละเอียดเพิ่มเติมจาก LINE)",
+        debugInfo: {
+          imageBufferLength: imageBuffer.length,
+          base64Length: richMenuImageBase64.length,
+          base64Preview: richMenuImageBase64.substring(0, 50),
+          base64EndPreview: richMenuImageBase64.substring(richMenuImageBase64.length - 50),
+        },
+      });
     }
 
     // ------------ ขั้นที่ 3: ตั้งเป็นเมนูเริ่มต้นของทุกคน ------------
