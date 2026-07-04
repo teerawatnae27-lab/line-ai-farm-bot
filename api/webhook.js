@@ -22,6 +22,13 @@ const MODEL_NAME = "gemini-2.5-flash";
 // วิธีหาค่านี้ดูในไฟล์ README หรือคำแนะนำที่แนบมาด้วย
 const OWNER_USER_ID = process.env.OWNER_USER_ID;
 
+// Upstash Redis (ใช้เก็บประวัติบทสนทนาแต่ละคน ให้บอทถามต่อเนื่องได้)
+// สมัครฟรีที่ upstash.com แล้วนำ URL/Token มาใส่ใน Environment Variables
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const CONVERSATION_TTL_SECONDS = 1800; // เก็บประวัติไว้ 30 นาที นับจากข้อความล่าสุด
+const MAX_HISTORY_MESSAGES = 10; // เก็บย้อนหลังสูงสุด 10 ข้อความ (5 รอบถาม-ตอบ)
+
 const lineClient = new line.Client(lineConfig);
 
 // ------------ ฟังก์ชันหลักที่ Vercel เรียกทุกครั้งที่มี request เข้ามา ------------
@@ -78,7 +85,7 @@ async function handleTextMessage(event) {
     "📷 ส่งรูปใบ/ต้นพืชที่มีปัญหา ผมจะช่วยวิเคราะห์เบื้องต้นให้ครับ\n" +
     "🌤️ พิมพ์ \"อากาศ ตามด้วยชื่อจังหวัด/อำเภอ\" เช่น \"อากาศ เชียงใหม่\" เพื่อดูพยากรณ์อากาศ\n" +
     "📍 หรือกดแชร์ตำแหน่ง (Location) เพื่อดูพยากรณ์อากาศจากพิกัดจริง แม่นยำกว่า\n" +
-    "💬 พิมพ์คำถามเกี่ยวกับการเพาะปลูกได้เลย\n\n" +
+    "💬 พิมพ์คำถามเกี่ยวกับการเพาะปลูกได้เลย ถามต่อเนื่องได้ บอทจะจำบทสนทนาไว้ให้ (ถ้าอยากเริ่มหัวข้อใหม่ พิมพ์ \"เริ่มคุยใหม่\")\n\n" +
     "🔒 การใช้งานบอทนี้ถือว่ายอมรับการเก็บข้อมูลตามนโยบายความเป็นส่วนตัว พิมพ์ \"ความเป็นส่วนตัว\" เพื่อดูรายละเอียดครับ";
 
   const privacyMsg =
@@ -96,6 +103,15 @@ async function handleTextMessage(event) {
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
       text: privacyMsg,
+    });
+  }
+
+  // คำสั่งล้างประวัติการสนทนา เริ่มคุยใหม่
+  if (text === "เริ่มคุยใหม่" || text === "ล้างประวัติ") {
+    await clearConversationHistory(event.source.userId);
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: "🔄 ล้างประวัติการสนทนาแล้วครับ เริ่มถามใหม่ได้เลย",
     });
   }
 
@@ -162,7 +178,17 @@ async function handleTextMessage(event) {
   }
 
   try {
-    const aiReply = await askGeminiText(text);
+    const userId = event.source.userId;
+    const history = await getConversationHistory(userId);
+    const aiReply = await askGeminiText(text, history);
+
+    const updatedHistory = [
+      ...history,
+      { role: "user", parts: [{ text }] },
+      { role: "model", parts: [{ text: aiReply }] },
+    ];
+    await saveConversationHistory(userId, updatedHistory);
+
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
       text: aiReply,
@@ -173,6 +199,54 @@ async function handleTextMessage(event) {
       type: "text",
       text: getFriendlyErrorMessage(err),
     });
+  }
+}
+
+// ============================================================
+// ความจำบทสนทนา (ใช้ Upstash Redis ฟรี เก็บประวัติแยกตามผู้ใช้แต่ละคน)
+// เอกสาร: https://upstash.com/
+// ============================================================
+
+// ------------ ดึงประวัติการสนทนาของผู้ใช้คนนั้น ------------
+async function getConversationHistory(userId) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return [];
+  try {
+    const res = await fetch(`${UPSTASH_URL}/get/chat:${userId}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+    const data = await res.json();
+    if (!data.result) return [];
+    return JSON.parse(data.result);
+  } catch (err) {
+    console.error("getConversationHistory error:", err);
+    return [];
+  }
+}
+
+// ------------ บันทึกประวัติการสนทนา (เก็บย้อนหลังจำกัดจำนวน + หมดอายุอัตโนมัติ) ------------
+async function saveConversationHistory(userId, history) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    const trimmed = history.slice(-MAX_HISTORY_MESSAGES);
+    await fetch(`${UPSTASH_URL}/set/chat:${userId}?EX=${CONVERSATION_TTL_SECONDS}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+      body: JSON.stringify(trimmed),
+    });
+  } catch (err) {
+    console.error("saveConversationHistory error:", err);
+  }
+}
+
+// ------------ ล้างประวัติการสนทนา (คำสั่ง "เริ่มคุยใหม่") ------------
+async function clearConversationHistory(userId) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    await fetch(`${UPSTASH_URL}/del/chat:${userId}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+  } catch (err) {
+    console.error("clearConversationHistory error:", err);
   }
 }
 
@@ -309,14 +383,19 @@ async function askGeminiVision(base64Image) {
   return result.response.text().trim();
 }
 
-// ------------ เรียก Gemini ตอบคำถามข้อความทั่วไป ------------
-async function askGeminiText(userText) {
+// ------------ เรียก Gemini ตอบคำถามข้อความทั่วไป (จำบทสนทนาก่อนหน้าได้) ------------
+async function askGeminiText(userText, history) {
   const systemPrompt = `คุณเป็นผู้ช่วยเกษตรกรไทย ตอบคำถามเกี่ยวกับการเพาะปลูก ปุ๋ย โรคพืช
-ราคาผลผลิต และเทคนิคการเกษตรแบบกระชับ เข้าใจง่าย ไม่เกิน 120 คำ ใช้ภาษาที่เป็นกันเอง`;
+ราคาผลผลิต และเทคนิคการเกษตรแบบกระชับ เข้าใจง่าย ไม่เกิน 120 คำ ใช้ภาษาที่เป็นกันเอง
+หากคำถามอ้างอิงถึงบทสนทนาก่อนหน้า ให้ใช้บริบทนั้นตอบต่อเนื่องได้เลย`;
 
-  const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+  const model = genAI.getGenerativeModel({
+    model: MODEL_NAME,
+    systemInstruction: systemPrompt,
+  });
 
-  const result = await model.generateContent([systemPrompt, userText]);
+  const chat = model.startChat({ history: history || [] });
+  const result = await chat.sendMessage(userText);
 
   return result.response.text().trim();
 }
