@@ -293,32 +293,38 @@ async function clearConversationHistory(userId) {
 
 // ------------ ค้นหารหัสสินค้าจากชื่อ แล้วดึงราคาล่าสุด ------------
 async function getCropPriceByKeyword(keyword) {
-  try {
-    // API ต้องระบุ sell_type เป็นภาษาอังกฤษ ลองทีละแบบจนกว่าจะเจอ
-    const sellTypes = ["retail", "wholesale"];
+  // API ต้องระบุ sell_type เป็นภาษาอังกฤษ ลองทีละแบบจนกว่าจะเจอ
+  const sellTypes = ["retail", "wholesale"];
+  let lastErrorWasTimeout = false;
 
-    for (const sellType of sellTypes) {
+  for (const sellType of sellTypes) {
+    try {
       const searchUrl = `https://dataapi.moc.go.th/gis-products?keyword=${encodeURIComponent(
         keyword
       )}&sell_type=${sellType}`;
 
-      const searchRes = await fetchWithTimeout(searchUrl, {}, 6000);
+      const searchRes = await fetchWithTimeout(
+        searchUrl,
+        { headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" } },
+        9000
+      );
       const searchData = await searchRes.json();
 
       if (searchData && searchData.length > 0) {
         const product = searchData[0];
-        return getCropPriceByProductId(product.product_id, product.product_name, sellType);
+        return await getCropPriceByProductId(product.product_id, product.product_name, sellType);
       }
+    } catch (err) {
+      console.error(`getCropPriceByKeyword error (${sellType}):`, err);
+      lastErrorWasTimeout = err.name === "AbortError";
+      // ลองแบบถัดไปต่อ ไม่หยุดทันที
     }
-
-    return `ขออภัยครับ ไม่พบสินค้าชื่อ "${keyword}" ในฐานข้อมูล ลองพิมพ์ชื่อสินค้าให้ตรงมากขึ้น เช่น "ราคาข้าวหอมมะลิ" หรือ "ราคามะเขือเทศสีดา" ครับ`;
-  } catch (err) {
-    console.error("getCropPriceByKeyword error:", err);
-    if (err.name === "AbortError") {
-      return "ขออภัยครับ ระบบราคาสินค้าตอบสนองช้าเกินไป กรุณาลองใหม่อีกครั้งครับ";
-    }
-    return "ขออภัยครับ ระบบค้นหาราคาสินค้าขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
   }
+
+  if (lastErrorWasTimeout) {
+    return "ขออภัยครับ ระบบราคาสินค้าของภาครัฐตอบสนองช้าผิดปกติในตอนนี้ กรุณาลองใหม่อีกครั้งในภายหลังครับ";
+  }
+  return `ขออภัยครับ ไม่พบสินค้าชื่อ "${keyword}" ในฐานข้อมูล ลองพิมพ์ชื่อสินค้าให้ตรงมากขึ้น เช่น "ราคาข้าวหอมมะลิ" หรือ "ราคามะเขือเทศสีดา" ครับ`;
 }
 
 // ------------ ดึงราคาสินค้าตามรหัส (ย้อนหลัง 7 วัน) ------------
@@ -334,7 +340,11 @@ async function getCropPriceByProductId(productId, productName, sellType) {
       `https://dataapi.moc.go.th/gis-product-price?product_id=${productId}` +
       `&from_date=${formatDate(weekAgo)}&to_date=${formatDate(today)}`;
 
-    const priceRes = await fetchWithTimeout(priceUrl, {}, 7000);
+    const priceRes = await fetchWithTimeout(
+      priceUrl,
+      { headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" } },
+      9000
+    );
     const priceData = await priceRes.json();
 
     if (!priceData || !priceData.price_list || priceData.price_list.length === 0) {
