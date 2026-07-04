@@ -78,6 +78,30 @@ async function handleTextMessage(event) {
     });
   }
 
+  // ปุ่มเมนู: วิธีใช้งาน
+  if (text === "วิธีใช้งาน") {
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: welcomeMsg,
+    });
+  }
+
+  // ปุ่มเมนู: ถามคำถามเกษตร
+  if (text === "ถามคำถามเกษตร") {
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: "พิมพ์คำถามเกี่ยวกับการเพาะปลูก ปุ๋ย โรคพืช หรือเทคนิคการเกษตรได้เลยครับ 🌾\nเช่น \"ปลูกพริกใส่ปุ๋ยอะไรดี\" หรือ \"มะเขือเทศใบเหลืองเกิดจากอะไร\"",
+    });
+  }
+
+  // ปุ่มเมนู: ติดต่อทีมงาน
+  if (text === "ติดต่อทีมงาน") {
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: "📞 ติดต่อทีมงานผู้ช่วยเกษตรกร AI\n\nพิมพ์ข้อความฝากไว้ตรงนี้ได้เลยครับ ทีมงานจะติดต่อกลับโดยเร็วที่สุด\n(หรือใส่เบอร์โทร/LINE ID/อีเมลของทีมคุณตรงนี้ได้)",
+    });
+  }
+
   // คำสั่งพยากรณ์อากาศ: "อากาศ <ชื่อสถานที่>"
   if (text.startsWith("อากาศ")) {
     const place = text.replace("อากาศ", "").trim();
