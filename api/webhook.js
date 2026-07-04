@@ -78,7 +78,26 @@ async function handleTextMessage(event) {
     "📷 ส่งรูปใบ/ต้นพืชที่มีปัญหา ผมจะช่วยวิเคราะห์เบื้องต้นให้ครับ\n" +
     "🌤️ พิมพ์ \"อากาศ ตามด้วยชื่อจังหวัด/อำเภอ\" เช่น \"อากาศ เชียงใหม่\" เพื่อดูพยากรณ์อากาศ\n" +
     "📍 หรือกดแชร์ตำแหน่ง (Location) เพื่อดูพยากรณ์อากาศจากพิกัดจริง แม่นยำกว่า\n" +
-    "💬 พิมพ์คำถามเกี่ยวกับการเพาะปลูกได้เลย";
+    "💬 พิมพ์คำถามเกี่ยวกับการเพาะปลูกได้เลย\n\n" +
+    "🔒 การใช้งานบอทนี้ถือว่ายอมรับการเก็บข้อมูลตามนโยบายความเป็นส่วนตัว พิมพ์ \"ความเป็นส่วนตัว\" เพื่อดูรายละเอียดครับ";
+
+  const privacyMsg =
+    "🔒 นโยบายความเป็นส่วนตัว (PDPA)\n\n" +
+    "ข้อมูลที่เราเก็บ:\n" +
+    "• รูปภาพที่คุณส่งมาวิเคราะห์ (ใช้ชั่วคราวเพื่อส่งให้ AI วิเคราะห์เท่านั้น)\n" +
+    "• ข้อความที่คุณพิมพ์คุยกับบอท\n" +
+    "• ตำแหน่งที่ตั้ง (เฉพาะตอนคุณกดแชร์ตำแหน่งเพื่อเช็คอากาศ)\n" +
+    "• ชื่อโปรไฟล์ LINE (เฉพาะตอนกดปุ่ม \"ติดต่อทีมงาน\" เพื่อให้ทีมงานรู้จักคุณ)\n\n" +
+    "วัตถุประสงค์: ใช้เพื่อวิเคราะห์และตอบคำถามการเกษตรเท่านั้น ไม่นำไปขายหรือใช้เพื่อการตลาดอื่นใด\n\n" +
+    "ผู้ประมวลผล: รูปภาพและข้อความจะถูกส่งไปยัง Google Gemini API เพื่อวิเคราะห์ ซึ่งอยู่ภายใต้นโยบายความเป็นส่วนตัวของ Google\n\n" +
+    "สิทธิของคุณ: สามารถหยุดใช้งานและบล็อกบัญชีนี้ได้ทุกเมื่อ หากต้องการให้ลบข้อมูล พิมพ์ \"ติดต่อทีมงาน\" แจ้งความประสงค์ได้ครับ";
+
+  if (text === "ความเป็นส่วนตัว" || text.toLowerCase() === "pdpa") {
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: privacyMsg,
+    });
+  }
 
   if (["สวัสดี", "hello", "hi", "help", "เริ่ม"].includes(text.toLowerCase())) {
     return lineClient.replyMessage(event.replyToken, {
@@ -142,11 +161,42 @@ async function handleTextMessage(event) {
     });
   }
 
-  const aiReply = await askGeminiText(text);
-  return lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: aiReply,
-  });
+  try {
+    const aiReply = await askGeminiText(text);
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: aiReply,
+    });
+  } catch (err) {
+    console.error("askGeminiText error:", err);
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: getFriendlyErrorMessage(err),
+    });
+  }
+}
+
+// ------------ แปลง error จาก Gemini ให้เป็นข้อความที่เข้าใจง่าย ------------
+function getFriendlyErrorMessage(err) {
+  const msg = (err && err.message ? err.message : "").toLowerCase();
+  const status = err && err.status;
+
+  // ชนโควตาฟรีรายวัน หรือถูก rate limit (429 / RESOURCE_EXHAUSTED)
+  if (
+    status === 429 ||
+    msg.includes("429") ||
+    msg.includes("resource_exhausted") ||
+    msg.includes("quota") ||
+    msg.includes("rate limit")
+  ) {
+    return (
+      "🙏 ขออภัยครับ ตอนนี้มีผู้ใช้งานเยอะมาก ระบบขอพักสักครู่\n" +
+      "กรุณาลองใหม่อีกครั้งใน 1-2 นาทีนะครับ 🙏"
+    );
+  }
+
+  // ปัญหาการเชื่อมต่อทั่วไป
+  return "ขออภัยครับ ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ หากยังไม่ได้ผล ลองพิมพ์ \"ติดต่อทีมงาน\" เพื่อแจ้งทีมงานได้ครับ";
 }
 
 // ------------ ส่งแจ้งเตือนไปหาเจ้าของบอท (เมื่อมีคนติดต่อทีมงาน) ------------
@@ -204,14 +254,22 @@ async function handleLocationMessage(event) {
 
 // ------------ รูปภาพ: วิเคราะห์โรคพืช ------------
 async function handleImageMessage(event) {
-  const imageBuffer = await downloadLineImage(event.message.id);
-  const base64Image = imageBuffer.toString("base64");
-  const diagnosis = await askGeminiVision(base64Image);
+  try {
+    const imageBuffer = await downloadLineImage(event.message.id);
+    const base64Image = imageBuffer.toString("base64");
+    const diagnosis = await askGeminiVision(base64Image);
 
-  return lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: diagnosis,
-  });
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: diagnosis,
+    });
+  } catch (err) {
+    console.error("Image handling error:", err);
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: getFriendlyErrorMessage(err),
+    });
+  }
 }
 
 async function downloadLineImage(messageId) {
