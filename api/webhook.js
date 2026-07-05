@@ -8,6 +8,7 @@
 
 const line = require("@line/bot-sdk");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { CROP_LIST, formatPriceMessage } = require("./crop-price-lib");
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -155,7 +156,6 @@ async function handleTextMessage(event) {
     const detail = text.replace("ติดต่อทีมงาน", "").trim();
 
     if (!detail) {
-      // กดปุ่มมาเฉยๆ ยังไม่มีรายละเอียด ให้พิมพ์ใหม่รวมข้อมูลในข้อความเดียว
       return lineClient.replyMessage(event.replyToken, {
         type: "text",
         text:
@@ -165,7 +165,6 @@ async function handleTextMessage(event) {
       });
     }
 
-    // มีรายละเอียดแนบมาด้วย ส่งแจ้งเตือนพร้อมเนื้อหาไปหาเจ้าของบอททันที
     await notifyOwner(event, "ฝากข้อความติดต่อทีมงาน", detail);
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
@@ -199,7 +198,7 @@ async function handleTextMessage(event) {
       });
     }
     try {
-      const priceReply = await getCropPriceByKeyword(keyword);
+      const priceReply = await getCropPriceFromCache(keyword);
       return lineClient.replyMessage(event.replyToken, {
         type: "text",
         text: priceReply,
@@ -240,10 +239,8 @@ async function handleTextMessage(event) {
 
 // ============================================================
 // ความจำบทสนทนา (ใช้ Upstash Redis ฟรี เก็บประวัติแยกตามผู้ใช้แต่ละคน)
-// เอกสาร: https://upstash.com/
 // ============================================================
 
-// ------------ ดึงประวัติการสนทนาของผู้ใช้คนนั้น ------------
 async function getConversationHistory(userId) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return [];
   try {
@@ -259,7 +256,6 @@ async function getConversationHistory(userId) {
   }
 }
 
-// ------------ บันทึกประวัติการสนทนา (เก็บย้อนหลังจำกัดจำนวน + หมดอายุอัตโนมัติ) ------------
 async function saveConversationHistory(userId, history) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
   try {
@@ -274,7 +270,6 @@ async function saveConversationHistory(userId, history) {
   }
 }
 
-// ------------ ล้างประวัติการสนทนา (คำสั่ง "เริ่มคุยใหม่") ------------
 async function clearConversationHistory(userId) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
   try {
@@ -287,89 +282,52 @@ async function clearConversationHistory(userId) {
 }
 
 // ============================================================
-// ฟีเจอร์ราคาพืชผลรายวัน (ใช้ MOC Open Data ฟรี ไม่ต้องมี API key)
-// เอกสาร: https://data.moc.go.th/OpenData/GISProductPrice
+// ฟีเจอร์ราคาพืชผลรายวัน
+// ข้อมูลถูกดึงมาเตรียมไว้ล่วงหน้าทุกเช้าโดย api/update-prices.js (Cron)
+// แล้วเก็บไว้ใน Redis จุดนี้แค่มาอ่านข้อมูลที่เตรียมไว้ ตอบเร็วเสมอ
 // ============================================================
 
-// ------------ ค้นหารหัสสินค้าจากชื่อ แล้วดึงราคาล่าสุด ------------
-async function getCropPriceByKeyword(keyword) {
-  // API ต้องระบุ sell_type เป็นภาษาอังกฤษ ลองทีละแบบจนกว่าจะเจอ
-  const sellTypes = ["retail", "wholesale"];
-  let lastErrorWasTimeout = false;
+async function getCropPriceFromCache(keyword) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+    return "ขออภัยครับ ระบบราคาสินค้ายังไม่พร้อมใช้งานในขณะนี้ครับ";
+  }
 
-  for (const sellType of sellTypes) {
-    try {
-      const searchUrl = `https://dataapi.moc.go.th/gis-products?keyword=${encodeURIComponent(
-        keyword
-      )}&sell_type=${sellType}`;
+  try {
+    const exactMatch = await readPriceCache(keyword);
+    if (exactMatch) return formatPriceMessage(exactMatch, keyword);
 
-      const searchRes = await fetchWithTimeout(
-        searchUrl,
-        { headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" } },
-        9000
-      );
-      const searchData = await searchRes.json();
+    const listRes = await fetch(`${UPSTASH_URL}/keys/price:*`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+    const listData = await listRes.json();
+    const keys = listData.result || [];
 
-      if (searchData && searchData.length > 0) {
-        const product = searchData[0];
-        return await getCropPriceByProductId(product.product_id, product.product_name, sellType);
-      }
-    } catch (err) {
-      console.error(`getCropPriceByKeyword error (${sellType}):`, err);
-      lastErrorWasTimeout = err.name === "AbortError";
-      // ลองแบบถัดไปต่อ ไม่หยุดทันที
+    const matchedKey = keys.find((k) => {
+      const cropName = decodeURIComponent(k.replace("price:", ""));
+      return cropName.includes(keyword) || keyword.includes(cropName);
+    });
+
+    if (matchedKey) {
+      const cropName = decodeURIComponent(matchedKey.replace("price:", ""));
+      const data = await readPriceCache(cropName);
+      if (data) return formatPriceMessage(data, keyword);
     }
-  }
 
-  if (lastErrorWasTimeout) {
-    return "ขออภัยครับ ระบบราคาสินค้าของภาครัฐตอบสนองช้าผิดปกติในตอนนี้ กรุณาลองใหม่อีกครั้งในภายหลังครับ";
+    const supportedList = CROP_LIST.join(", ");
+    return `ขออภัยครับ ยังไม่มีข้อมูลราคาของ "${keyword}" ในระบบครับ\n\nตอนนี้รองรับสินค้า: ${supportedList}\n\nถ้าอยากให้เพิ่มสินค้าอื่น พิมพ์ "ติดต่อทีมงาน" แจ้งชื่อสินค้าที่ต้องการได้ครับ`;
+  } catch (err) {
+    console.error("getCropPriceFromCache error:", err);
+    return "ขออภัยครับ ระบบราคาสินค้าขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
   }
-  return `ขออภัยครับ ไม่พบสินค้าชื่อ "${keyword}" ในฐานข้อมูล ลองพิมพ์ชื่อสินค้าให้ตรงมากขึ้น เช่น "ราคาข้าวหอมมะลิ" หรือ "ราคามะเขือเทศสีดา" ครับ`;
 }
 
-// ------------ ดึงราคาสินค้าตามรหัส (ย้อนหลัง 7 วัน) ------------
-async function getCropPriceByProductId(productId, productName, sellType) {
-  try {
-    const today = new Date();
-    const weekAgo = new Date(today);
-    weekAgo.setDate(today.getDate() - 7);
-
-    const formatDate = (d) => d.toISOString().split("T")[0];
-
-    const priceUrl =
-      `https://dataapi.moc.go.th/gis-product-price?product_id=${productId}` +
-      `&from_date=${formatDate(weekAgo)}&to_date=${formatDate(today)}`;
-
-    const priceRes = await fetchWithTimeout(
-      priceUrl,
-      { headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" } },
-      9000
-    );
-    const priceData = await priceRes.json();
-
-    if (!priceData || !priceData.price_list || priceData.price_list.length === 0) {
-      return `ขออภัยครับ ยังไม่มีข้อมูลราคาล่าสุดของ "${productName}" ในช่วง 7 วันที่ผ่านมาครับ`;
-    }
-
-    const latest = priceData.price_list[priceData.price_list.length - 1];
-    const unit = priceData.unit || "หน่วย";
-    const typeLabel = sellType === "wholesale" ? "ราคาขายส่ง" : "ราคาขายปลีก";
-
-    let reply =
-      `💰 ${typeLabel} - ${priceData.product_name || productName}\n\n` +
-      `📅 ข้อมูลล่าสุดวันที่: ${latest.date}\n` +
-      `💵 ราคา: ${latest.price_min}-${latest.price_max} บาท/${unit}\n\n` +
-      `📊 เฉลี่ย 7 วันที่ผ่านมา: ${priceData.price_min_avg}-${priceData.price_max_avg} บาท/${unit}\n\n` +
-      `ข้อมูลจาก: กรมการค้าภายใน กระทรวงพาณิชย์`;
-
-    return reply;
-  } catch (err) {
-    console.error("getCropPriceByProductId error:", err);
-    if (err.name === "AbortError") {
-      return "ขออภัยครับ ระบบราคาสินค้าตอบสนองช้าเกินไป กรุณาลองใหม่อีกครั้งครับ";
-    }
-    return "ขออภัยครับ ระบบดึงราคาสินค้าขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
-  }
+async function readPriceCache(keyword) {
+  const res = await fetch(`${UPSTASH_URL}/get/price:${encodeURIComponent(keyword)}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+  });
+  const data = await res.json();
+  if (!data.result) return null;
+  return JSON.parse(data.result);
 }
 
 // ------------ แปลง error จาก Gemini ให้เป็นข้อความที่เข้าใจง่าย ------------
@@ -377,7 +335,6 @@ function getFriendlyErrorMessage(err) {
   const msg = (err && err.message ? err.message : "").toLowerCase();
   const status = err && err.status;
 
-  // ชนโควตาฟรีรายวัน หรือถูก rate limit (429 / RESOURCE_EXHAUSTED)
   if (
     status === 429 ||
     msg.includes("429") ||
@@ -391,16 +348,13 @@ function getFriendlyErrorMessage(err) {
     );
   }
 
-  // ปัญหาการเชื่อมต่อทั่วไป
   return "ขออภัยครับ ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ หากยังไม่ได้ผล ลองพิมพ์ \"ติดต่อทีมงาน\" เพื่อแจ้งทีมงานได้ครับ";
 }
 
 // ------------ ส่งแจ้งเตือนไปหาเจ้าของบอท (เมื่อมีคนติดต่อทีมงาน) ------------
 async function notifyOwner(event, actionLabel, detail) {
   if (!OWNER_USER_ID) {
-    console.error(
-      "ยังไม่ได้ตั้งค่า OWNER_USER_ID ใน Environment Variables จึงส่งแจ้งเตือนไม่ได้"
-    );
+    console.error("ยังไม่ได้ตั้งค่า OWNER_USER_ID ใน Environment Variables จึงส่งแจ้งเตือนไม่ได้");
     return;
   }
 
@@ -415,214 +369,4 @@ async function notifyOwner(event, actionLabel, detail) {
       console.error("ดึงโปรไฟล์ผู้ใช้ไม่สำเร็จ:", e);
     }
 
-    const now = new Date().toLocaleString("th-TH", { timeZone: "Asia/Bangkok" });
-
-    let messageText =
-      `🔔 แจ้งเตือน: มีลูกค้า${actionLabel}\n\n` +
-      `👤 ชื่อ: ${displayName}\n` +
-      `🕐 เวลา: ${now}\n`;
-
-    if (detail) {
-      messageText += `\n💬 ข้อความจากลูกค้า:\n"${detail}"\n`;
-    }
-
-    messageText += `\nวิธีตอบกลับ: เปิด LINE Official Account Manager (manager.line.biz) > เมนู "แชท" > ค้นหาชื่อ "${displayName}" แล้วพิมพ์ตอบกลับได้โดยตรงครับ`;
-
-    await lineClient.pushMessage(OWNER_USER_ID, {
-      type: "text",
-      text: messageText,
-    });
-  } catch (err) {
-    console.error("ส่งแจ้งเตือนหาเจ้าของบอทไม่สำเร็จ:", err);
-  }
-}
-
-// ------------ ตำแหน่งที่แชร์มาจาก LINE (Location message) ------------
-async function handleLocationMessage(event) {
-  const { latitude, longitude, title } = event.message;
-  const weatherReply = await getWeatherByCoords(latitude, longitude, title);
-
-  return lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: weatherReply,
-  });
-}
-
-// ------------ รูปภาพ: วิเคราะห์โรคพืช ------------
-async function handleImageMessage(event) {
-  try {
-    const imageBuffer = await downloadLineImage(event.message.id);
-    const base64Image = imageBuffer.toString("base64");
-    const diagnosis = await askGeminiVision(base64Image);
-
-    return lineClient.replyMessage(event.replyToken, {
-      type: "text",
-      text: diagnosis,
-    });
-  } catch (err) {
-    console.error("Image handling error:", err);
-    return lineClient.replyMessage(event.replyToken, {
-      type: "text",
-      text: getFriendlyErrorMessage(err),
-    });
-  }
-}
-
-async function downloadLineImage(messageId) {
-  const stream = await lineClient.getMessageContent(messageId);
-  const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-}
-
-// ------------ เรียก Gemini วิเคราะห์รูปภาพ ------------
-async function askGeminiVision(base64Image) {
-  const systemPrompt = `คุณเป็นผู้เชี่ยวชาญด้านโรคพืชและการเกษตรของไทย
-วิเคราะห์รูปภาพที่ได้รับแล้วตอบเป็นภาษาไทยแบบกระชับ อ่านง่ายสำหรับเกษตรกร โดยมีหัวข้อดังนี้:
-
-🔍 สิ่งที่พบ: (อธิบายอาการที่เห็นในรูป)
-🌾 คาดว่าเป็น: (ชื่อโรค/ปัญหาที่เป็นไปได้ 1-2 อย่าง)
-💊 วิธีแก้เบื้องต้น: (คำแนะนำที่ทำได้จริง 2-3 ข้อ)
-⚠️ หมายเหตุ: นี่เป็นคำแนะนำเบื้องต้นจาก AI หากอาการรุนแรงหรือลุกลาม ควรปรึกษาเกษตรอำเภอหรือผู้เชี่ยวชาญในพื้นที่
-
-ตอบให้สั้น กระชับ ไม่เกิน 150 คำ ใช้ภาษาที่เกษตรกรทั่วไปเข้าใจง่าย`;
-
-  const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-
-  const result = await model.generateContent([
-    systemPrompt,
-    {
-      inlineData: {
-        mimeType: "image/jpeg",
-        data: base64Image,
-      },
-    },
-    "ช่วยวิเคราะห์รูปพืชนี้ให้หน่อยครับ",
-  ]);
-
-  return result.response.text().trim();
-}
-
-// ------------ เรียก Gemini ตอบคำถามข้อความทั่วไป (จำบทสนทนาก่อนหน้าได้) ------------
-async function askGeminiText(userText, history) {
-  const systemPrompt = `คุณเป็นผู้ช่วยเกษตรกรไทย ตอบคำถามเกี่ยวกับการเพาะปลูก ปุ๋ย โรคพืช
-ราคาผลผลิต และเทคนิคการเกษตรแบบกระชับ เข้าใจง่าย ไม่เกิน 120 คำ ใช้ภาษาที่เป็นกันเอง
-หากคำถามอ้างอิงถึงบทสนทนาก่อนหน้า ให้ใช้บริบทนั้นตอบต่อเนื่องได้เลย`;
-
-  const model = genAI.getGenerativeModel({
-    model: MODEL_NAME,
-    systemInstruction: systemPrompt,
-  });
-
-  const chat = model.startChat({ history: history || [] });
-  const result = await chat.sendMessage(userText);
-
-  return result.response.text().trim();
-}
-
-// ============================================================
-// ฟีเจอร์พยากรณ์อากาศ (ใช้ Open-Meteo API ฟรี ไม่ต้องมี API key)
-// เอกสาร: https://open-meteo.com/
-// ============================================================
-
-// ------------ ค้นหาพิกัดจากชื่อสถานที่ แล้วดึงพยากรณ์อากาศ ------------
-async function getWeatherByPlaceName(place) {
-  try {
-    const geoUrl =
-      "https://geocoding-api.open-meteo.com/v1/search?" +
-      `name=${encodeURIComponent(place)}&count=1&language=th&format=json`;
-
-    const geoRes = await fetch(geoUrl);
-    const geoData = await geoRes.json();
-
-    if (!geoData.results || geoData.results.length === 0) {
-      return `ขออภัยครับ หาสถานที่ชื่อ "${place}" ไม่เจอ ลองพิมพ์เป็นชื่อจังหวัดหรืออำเภอเป็นภาษาไทย/อังกฤษดูอีกครั้งครับ\nหรือกดแชร์ตำแหน่ง (Location) จากเมนู + ในแชทแทนก็ได้ครับ`;
-    }
-
-    const location = geoData.results[0];
-    const displayName = location.name || place;
-
-    return getWeatherByCoords(location.latitude, location.longitude, displayName);
-  } catch (err) {
-    console.error("Geocoding error:", err);
-    return "ขออภัยครับ ระบบค้นหาตำแหน่งขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
-  }
-}
-
-// ------------ ดึงพยากรณ์อากาศจากพิกัด lat/lon ------------
-async function getWeatherByCoords(lat, lon, placeName) {
-  try {
-    const weatherUrl =
-      "https://api.open-meteo.com/v1/forecast?" +
-      `latitude=${lat}&longitude=${lon}` +
-      "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max" +
-      "&timezone=Asia%2FBangkok&forecast_days=4";
-
-    const res = await fetch(weatherUrl);
-    const data = await res.json();
-
-    if (!data.daily) {
-      return "ขออภัยครับ ดึงข้อมูลพยากรณ์อากาศไม่สำเร็จ กรุณาลองใหม่อีกครั้งครับ";
-    }
-
-    const { time, weather_code, temperature_2m_max, temperature_2m_min, precipitation_probability_max } =
-      data.daily;
-
-    const dayLabels = ["วันนี้", "พรุ่งนี้", "มะรืนนี้", "อีก 3 วัน"];
-
-    let reply = `🌤️ พยากรณ์อากาศ${placeName ? " - " + placeName : ""}\n\n`;
-
-    for (let i = 0; i < time.length && i < dayLabels.length; i++) {
-      const icon = weatherCodeToIcon(weather_code[i]);
-      const desc = weatherCodeToThai(weather_code[i]);
-      reply += `${dayLabels[i]}: ${icon} ${desc}\n`;
-      reply += `   🌡️ ${temperature_2m_min[i]}-${temperature_2m_max[i]}°C  💧 ฝนตก ${precipitation_probability_max[i]}%\n`;
-    }
-
-    reply += "\n💡 หากมีโอกาสฝนตกสูง ควรเลี่ยงการฉีดพ่นปุ๋ย/ยาในวันนั้น";
-
-    return reply;
-  } catch (err) {
-    console.error("Weather fetch error:", err);
-    return "ขออภัยครับ ระบบพยากรณ์อากาศขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ";
-  }
-}
-
-// ------------ แปลงรหัสสภาพอากาศ (WMO code) เป็นข้อความไทย ------------
-function weatherCodeToThai(code) {
-  const map = {
-    0: "ท้องฟ้าแจ่มใส",
-    1: "แจ่มใสเป็นส่วนใหญ่",
-    2: "มีเมฆบางส่วน",
-    3: "มีเมฆมาก",
-    45: "หมอก",
-    48: "หมอกน้ำแข็ง",
-    51: "ฝนปรอยเบา",
-    53: "ฝนปรอยปานกลาง",
-    55: "ฝนปรอยหนัก",
-    61: "ฝนตกเบา",
-    63: "ฝนตกปานกลาง",
-    65: "ฝนตกหนัก",
-    71: "หิมะตกเบา",
-    80: "ฝนตกเป็นช่วง",
-    81: "ฝนตกเป็นช่วงปานกลาง",
-    82: "ฝนตกเป็นช่วงหนัก",
-    95: "พายุฝนฟ้าคะนอง",
-    96: "พายุฝนฟ้าคะนองมีลูกเห็บ",
-  };
-  return map[code] || "ไม่ทราบสภาพอากาศ";
-}
-
-// ------------ แปลงรหัสสภาพอากาศเป็นไอคอน emoji ------------
-function weatherCodeToIcon(code) {
-  if (code === 0 || code === 1) return "☀️";
-  if (code === 2) return "🌤️";
-  if (code === 3) return "☁️";
-  if (code === 45 || code === 48) return "🌫️";
-  if ([51, 53, 55, 61, 63, 65, 80, 81, 82].includes(code)) return "🌧️";
-  if (code === 71) return "❄️";
-  if (code === 95 || code === 96) return "⛈️";
-  return "🌡️";
-}
+    const now = new Date().toLocaleString("th-TH", {
